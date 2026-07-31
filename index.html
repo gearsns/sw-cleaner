@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="ja">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Service Worker & Storage 統合管理ツール</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            max-width: 900px;
+            margin: 2rem auto;
+            padding: 0 1rem;
+            color: #333;
+            line-height: 1.5;
+        }
+
+        h1 {
+            border-bottom: 2px solid #eaeaea;
+            padding-bottom: 0.5rem;
+        }
+
+        h2 {
+            margin-top: 2rem;
+            border-left: 4px solid #007bff;
+            padding-left: 0.5rem;
+        }
+
+        .summary-card {
+            background: #f8f9fa;
+            border: 1px solid #e9ecef;
+            border-radius: 8px;
+            padding: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        /* テーブル共通スタイル */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.85rem;
+            margin-bottom: 1rem;
+        }
+
+        th,
+        td {
+            border: 1px solid #eee;
+            padding: 0.75rem;
+            text-align: left;
+            word-break: break-all;
+        }
+
+        th {
+            background: #fafafa;
+            font-weight: 600;
+            color: #555;
+        }
+
+        /* アコーディオンのスタイル */
+        details {
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            margin-bottom: 0.75rem;
+            background: #fff;
+            overflow: hidden;
+        }
+
+        summary {
+            padding: 0.75rem 1rem;
+            background: #f1f3f5;
+            cursor: pointer;
+            font-weight: bold;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            list-style: none;
+        }
+
+        summary::-webkit-details-marker {
+            display: none;
+        }
+
+        summary:hover {
+            background: #e9ecef;
+        }
+
+        .summary-title {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+
+        .badge {
+            background: #007bff;
+            color: white;
+            padding: 0.2rem 0.5rem;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: normal;
+        }
+
+        .badge-secondary {
+            background: #6c757d;
+            color: white;
+            padding: 0.2rem 0.5rem;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: normal;
+        }
+
+        /* ボタン */
+        .btn {
+            padding: 0.35rem 0.7rem;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.8rem;
+        }
+
+        .btn-danger {
+            background-color: #dc3545;
+            color: white;
+        }
+
+        .btn-danger:hover {
+            background-color: #c82333;
+        }
+
+        .btn-outline {
+            background: transparent;
+            border: 1px solid #dc3545;
+            color: #dc3545;
+        }
+
+        .btn-outline:hover {
+            background: #dc3545;
+            color: white;
+        }
+
+        .empty-state {
+            padding: 1.5rem;
+            text-align: center;
+            color: #6c757d;
+            background: #fafafa;
+            border-radius: 6px;
+        }
+    </style>
+</head>
+
+<body>
+
+    <h1>⚙️ Service Worker & Cache 統合管理</h1>
+
+    <div class="summary-card">
+        <span id="total-info">情報を計算中...</span>
+    </div>
+
+    <!-- 1. Service Worker 管理エリア -->
+    <h2>🤖 登録済み Service Worker 一覧</h2>
+    <div id="sw-container">読み込み中...</div>
+
+    <!-- 2. Cache Storage アコーディオンエリア -->
+    <h2>📦 Cache Storage（キャッシュ詳細内訳）</h2>
+    <div id="cache-container">読み込み中...</div>
+
+    <script>
+        // 容量表示のフォーマット関数
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 Bytes';
+            const k = 1024;
+            const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+
+        // スコープのURLから <title> を非同期取得する関数
+        // タイムアウト機能付きのサイトタイトル取得関数
+        async function getSiteTitle(scopeUrl) {
+            // 3秒で強制遮断するタイマーを設定
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 3000);
+
+            try {
+                const targetUrl = scopeUrl.endsWith('/') ? `${scopeUrl}index.html` : scopeUrl;
+
+                // signal オプションを渡してタイムアウト可能にする
+                const res = await fetch(targetUrl, {
+                    method: 'GET',
+                    cache: 'no-store',
+                    signal: controller.signal
+                });
+
+                clearTimeout(timeoutId); // 成功したらタイマー解除
+
+                if (!res.ok) return `(アクセス不可: HTTP ${res.status})`;
+                const text = await res.text();
+                const doc = new DOMParser().parseFromString(text, 'text/html');
+                return doc.title?.trim() || '(タイトルタグなし)';
+
+            } catch (e) {
+                clearTimeout(timeoutId);
+
+                // タイムアウトで中断された場合
+                if (e.name === 'AbortError') {
+                    return '(応答タイムアウト/SW停止中)';
+                }
+                return '(ページ消去済み/取得不可)';
+            }
+        }
+
+        // メインの再描画処理
+        async function renderAll() {
+            await renderServiceWorkers();
+            await renderCacheStorage();
+        }
+
+        // --- 1. Service Worker のレンダリング ---
+        async function renderServiceWorkers() {
+            const container = document.getElementById('sw-container');
+
+            if (!('serviceWorker' in navigator)) {
+                container.innerHTML = '<div class="empty-state">このブラウザは Service Worker に未対応です。</div>';
+                return;
+            }
+
+            const registrations = await navigator.serviceWorker.getRegistrations();
+
+            if (registrations.length === 0) {
+                container.innerHTML = '<div class="empty-state">現在登録されている Service Worker はありません。</div>';
+                return;
+            }
+
+            const table = document.createElement('table');
+            table.innerHTML = `
+        <thead>
+          <tr>
+            <th>サイトタイトル</th>
+            <th>スコープ (URL)</th>
+            <th>状態</th>
+            <th style="width: 80px;">操作</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      `;
+
+            const tbody = table.querySelector('tbody');
+
+            for (const reg of registrations) {
+                const tr = document.createElement('tr');
+                const state = reg.active ? '稼働中 (active)' : (reg.installing ? 'インストール中' : '待機中');
+
+                // 1. 最初にHTML構造を一括で生成する（class="title-cell" を付けておく）
+                tr.innerHTML = `
+    <td class="title-cell">取得中...</td>
+    <td><code>${reg.scope}</code></td>
+    <td><span class="badge-secondary">${state}</span></td>
+    <td></td>
+  `;
+
+                // 2. 生成された「画面上の実要素」を取得する
+                const titleTd = tr.querySelector('.title-cell');
+
+                // 3. 非同期で取得後、画面上の実要素を書き換える
+                getSiteTitle(reg.scope).then(title => {
+                    titleTd.innerText = title;
+                });
+
+                // 4. 削除ボタンの追加
+                const actionTd = tr.querySelector('td:last-child');
+                const delBtn = document.createElement('button');
+                delBtn.className = 'btn btn-danger';
+                delBtn.innerText = '解除';
+                delBtn.onclick = async () => {
+                    await reg.unregister();
+                    alert(`Service Worker を解除しました:\n${reg.scope}`);
+                    renderAll();
+                };
+                actionTd.appendChild(delBtn);
+
+                tbody.appendChild(tr);
+            }
+
+            container.innerHTML = '';
+            container.appendChild(table);
+        }
+
+        // --- 2. Cache Storage アコーディオンのレンダリング ---
+        async function renderCacheStorage() {
+            const container = document.getElementById('cache-container');
+            const totalInfo = document.getElementById('total-info');
+
+            if (!('caches' in window)) {
+                container.innerHTML = '<div class="empty-state">このブラウザは Cache Storage に未対応です。</div>';
+                return;
+            }
+
+            const cacheKeys = await caches.keys();
+            const swRegistrations = 'serviceWorker' in navigator ? await navigator.serviceWorker.getRegistrations() : [];
+
+            if (cacheKeys.length === 0) {
+                container.innerHTML = '<div class="empty-state">保存されているキャッシュはありません。</div>';
+                totalInfo.innerText = `登録SW数: ${swRegistrations.length} 件 / キャッシュ総容量: 0 Bytes`;
+                return;
+            }
+
+            container.innerHTML = '';
+            let grandTotalSize = 0;
+            let grandTotalFiles = 0;
+
+            for (const cacheName of cacheKeys) {
+                const cache = await caches.open(cacheName);
+                const requests = await cache.keys();
+
+                let cacheTotalSize = 0;
+                const fileDetails = [];
+
+                for (const req of requests) {
+                    try {
+                        const res = await cache.match(req);
+                        if (res) {
+                            const blob = await res.blob();
+                            const size = blob.size;
+                            const contentType = res.headers.get('content-type') || '不明';
+
+                            cacheTotalSize += size;
+                            fileDetails.push({
+                                request: req,
+                                url: req.url,
+                                size: size,
+                                type: contentType.split(';')[0]
+                            });
+                        }
+                    } catch (e) { }
+                }
+
+                grandTotalSize += cacheTotalSize;
+                grandTotalFiles += requests.length;
+
+                // アコーディオン構築
+                const details = document.createElement('details');
+                const summary = document.createElement('summary');
+                summary.innerHTML = `
+          <div class="summary-title">
+            <span>▶ <b>${cacheName}</b></span>
+            <span class="badge">${requests.length} 件</span>
+            <span class="badge-secondary">${formatBytes(cacheTotalSize)}</span>
+          </div>
+          <div>
+            <button class="btn btn-outline" onclick="deleteEntireCache(event, '${cacheName}')">一括削除</button>
+          </div>
+        `;
+
+                const table = document.createElement('table');
+                table.innerHTML = `
+          <thead>
+            <tr>
+              <th>ファイルパス (URL)</th>
+              <th style="width: 140px;">種類</th>
+              <th style="width: 100px;">容量</th>
+              <th style="width: 70px;">操作</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        `;
+
+                const tbody = table.querySelector('tbody');
+
+                if (fileDetails.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;">空のキャッシュです</td></tr>';
+                } else {
+                    fileDetails.forEach(file => {
+                        const tr = document.createElement('tr');
+                        tr.innerHTML = `
+              <td><code>${file.url}</code></td>
+              <td>${file.type}</td>
+              <td>${formatBytes(file.size)}</td>
+              <td></td>
+            `;
+
+                        const actionTd = tr.querySelector('td:last-child');
+                        const delBtn = document.createElement('button');
+                        delBtn.className = 'btn btn-danger';
+                        delBtn.innerText = '削除';
+                        delBtn.onclick = async () => {
+                            await cache.delete(file.request);
+                            renderAll();
+                        };
+                        actionTd.appendChild(delBtn);
+
+                        tbody.appendChild(tr);
+                    });
+                }
+
+                details.appendChild(summary);
+                details.appendChild(table);
+                container.appendChild(details);
+            }
+
+            totalInfo.innerText = `登録SW数: ${swRegistrations.length} 件 / キャッシュ名数: ${cacheKeys.length} 個 (${grandTotalFiles} ファイル) / 総容量: ${formatBytes(grandTotalSize)}`;
+        }
+
+        // キャッシュキー全体の削除
+        async function deleteEntireCache(event, cacheName) {
+            event.preventDefault();
+            if (confirm(`キャッシュ「${cacheName}」を丸ごと削除しますか？`)) {
+                await caches.delete(cacheName);
+                renderAll();
+            }
+        }
+
+        // 初期実行
+        renderAll();
+    </script>
+</body>
+
+</html>
